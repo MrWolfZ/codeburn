@@ -101,22 +101,96 @@ type LegacyToolRequest = {
 // branch (`{ type: string; data: Record<string, unknown> }`); a literal type
 // like `'user.message'` is assignable to `string`, so TS picked the catch-all
 // over the specific branches when narrowing on `type`, which propagated
-// `unknown`/`{}` into `event.data.content` etc. We now keep only the three
-// shapes we actually read from. Unknown event types fall through the if/else
-// chain without further narrowing — they are not in the union, but JSON.parse
+// `unknown`/`{}` into `event.data.content` etc. We now keep only the shapes
+// we actually read from. Unknown event types fall through the if/else chain
+// without further narrowing — they are not in the union, but JSON.parse
 // returns `any` so we re-type as LegacyCopilotEvent and let the runtime type
 // guards (`event.type === 'X'`) ignore anything else.
 type LegacyCopilotEvent =
   | { type: 'session.model_change'; timestamp?: string; data: { newModel: string; model?: string } }
   | { type: 'user.message'; timestamp?: string; data: { content: string; interactionId?: string; model?: string } }
   | { type: 'assistant.message'; timestamp?: string; data: { messageId: string; outputTokens: number; interactionId?: string; toolRequests?: LegacyToolRequest[]; model?: string } }
+  | { type: 'session.shutdown'; data: { modelMetrics?: Record<string, { usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number } }> } }
+
+// Shape for the per-model totals emitted in a session.shutdown event.
+type ModelUsageTotals = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+}
+
+// Collect per-model totals from a session.shutdown event, if present.
+function extractModelMetrics(events: LegacyCopilotEvent[]): Map<string, ModelUsageTotals> {
+  const metrics = new Map<string, ModelUsageTotals>()
+
+  for (const event of events) {
+    if (event.type !== 'session.shutdown') continue
+    const shutdownData = event.data as { modelMetrics?: Record<string, { usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number } }> }
+    const rawMetrics = shutdownData.modelMetrics
+    if (!rawMetrics) continue
+
+    for (const [modelName, entry] of Object.entries(rawMetrics)) {
+      const usage = entry.usage ?? {}
+      metrics.set(modelName, {
+        inputTokens: usage.inputTokens ?? 0,
+        outputTokens: usage.outputTokens ?? 0,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+        reasoningTokens: usage.reasoningTokens ?? 0,
+      })
+    }
+  }
+
+  return metrics
+}
+
+// Distribute per-model totals from session.shutdown across calls.
+// Input tokens are allocated proportionally to each call's output token
+// share within its model. This gives a meaningful per-call breakdown
+// instead of the previous hardcoded-zero approach.
+function distributeModelMetrics(results: ParsedProviderCall[], modelMetrics: Map<string, ModelUsageTotals>): void {
+  if (modelMetrics.size === 0) return
+
+  // Accumulate output token totals per model from parsed calls.
+  const outputTotals = new Map<string, number>()
+  for (const call of results) {
+    outputTotals.set(call.model, (outputTotals.get(call.model) ?? 0) + call.outputTokens)
+  }
+
+  for (const call of results) {
+    const totals = modelMetrics.get(call.model)
+    if (!totals || totals.outputTokens === 0) continue
+
+    // Proportional share: this call's output tokens / model's total output.
+    const modelOutputTotal = outputTotals.get(call.model) ?? 0
+    const ratio = modelOutputTotal > 0 ? call.outputTokens / modelOutputTotal : 0
+
+    call.inputTokens = Math.round(totals.inputTokens * ratio)
+    call.cacheReadInputTokens = Math.round(totals.cacheReadTokens * ratio)
+    call.cacheCreationInputTokens = Math.round(totals.cacheWriteTokens * ratio)
+    call.cachedInputTokens = call.cacheReadInputTokens
+    call.reasoningTokens = Math.round(totals.reasoningTokens * ratio)
+
+    // Recalculate cost with the distributed token counts.
+    call.costUSD = calculateCost(
+      call.model,
+      call.inputTokens,
+      call.outputTokens + call.reasoningTokens,
+      call.cacheCreationInputTokens,
+      call.cacheReadInputTokens,
+      0,
+    )
+  }
+}
 
 function parseLegacyEvents(content: string, sessionId: string, seenKeys: Set<string>): ParsedProviderCall[] {
   const results: ParsedProviderCall[] = []
   const lines = content.split('\n').filter(l => l.trim())
-  let currentModel = ''
-  let pendingUserMessage = ''
+  const events: LegacyCopilotEvent[] = []
 
+  // Pass 1: parse all JSON lines into typed events.
   for (const line of lines) {
     let event: LegacyCopilotEvent
     try {
@@ -124,7 +198,17 @@ function parseLegacyEvents(content: string, sessionId: string, seenKeys: Set<str
     } catch {
       continue
     }
+    events.push(event)
+  }
 
+  // Extract per-model totals from session.shutdown, if present.
+  const modelMetrics = extractModelMetrics(events)
+
+  // Pass 2: walk events to build per-call results.
+  let currentModel = ''
+  let pendingUserMessage = ''
+
+  for (const event of events) {
     // Some newer events include the model ID explicitly.
     const data = event.data as { newModel?: string; model?: string }
     if (typeof data.model === 'string' && data.model) {
@@ -160,8 +244,6 @@ function parseLegacyEvents(content: string, sessionId: string, seenKeys: Set<str
         .map(t => normalizeToolName(t?.name))
         .filter(Boolean)
 
-      const costUSD = calculateCost(currentModel, 0, outputTokens, 0, 0, 0)
-
       results.push({
         provider: 'copilot',
         model: currentModel,
@@ -172,7 +254,7 @@ function parseLegacyEvents(content: string, sessionId: string, seenKeys: Set<str
         cachedInputTokens: 0,
         reasoningTokens: 0,
         webSearchRequests: 0,
-        costUSD,
+        costUSD: 0,
         tools,
         bashCommands: [],
         timestamp: event.timestamp ?? '',
@@ -184,6 +266,17 @@ function parseLegacyEvents(content: string, sessionId: string, seenKeys: Set<str
 
       pendingUserMessage = ''
     }
+  }
+
+  // Pass 3: distribute model-level totals across per-call results.
+  // If no shutdown metrics exist (older sessions), recalculate cost from
+  // output tokens alone to preserve backward compatibility.
+  if (modelMetrics.size === 0) {
+    for (const call of results) {
+      call.costUSD = calculateCost(call.model, 0, call.outputTokens, 0, 0, 0)
+    }
+  } else {
+    distributeModelMetrics(results, modelMetrics)
   }
 
   return results
@@ -243,6 +336,33 @@ function inferModelFromToolCallIds(events: TranscriptEvent[]): string {
   return 'copilot-auto'
 }
 
+// Extract per-model totals from session.shutdown in transcript-format events.
+// TranscriptEvent has a catch-all branch so shutdown events parse but have
+// `data: Record<string, unknown>`, so we need a separate typed extraction.
+function extractTranscriptModelMetrics(events: TranscriptEvent[]): Map<string, ModelUsageTotals> {
+  const metrics = new Map<string, ModelUsageTotals>()
+
+  for (const event of events) {
+    if (event.type !== 'session.shutdown') continue
+    const raw = event.data as Record<string, unknown>
+    const mm = raw.modelMetrics as Record<string, { usage?: Record<string, number> }> | undefined
+    if (!mm) continue
+
+    for (const [modelName, entry] of Object.entries(mm)) {
+      const usage = entry.usage ?? {}
+      metrics.set(modelName, {
+        inputTokens: usage.inputTokens ?? 0,
+        outputTokens: usage.outputTokens ?? 0,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+        reasoningTokens: usage.reasoningTokens ?? 0,
+      })
+    }
+  }
+
+  return metrics
+}
+
 function parseTranscriptEvents(content: string, sessionId: string, seenKeys: Set<string>): ParsedProviderCall[] {
   const results: ParsedProviderCall[] = []
   const lines = content.split('\n').filter(l => l.trim())
@@ -257,6 +377,11 @@ function parseTranscriptEvents(content: string, sessionId: string, seenKeys: Set
   }
 
   const model = inferModelFromToolCallIds(events)
+
+  // Extract per-model totals from session.shutdown, if present.
+  const modelMetrics = extractTranscriptModelMetrics(events)
+  const hasMetrics = modelMetrics.size > 0
+
   let pendingUserMessage = ''
 
   for (const event of events) {
@@ -278,13 +403,15 @@ function parseTranscriptEvents(content: string, sessionId: string, seenKeys: Set
       seenKeys.add(dedupKey)
 
       let outputTokens = data.outputTokens ?? 0
-      let reasoningTokens = 0
+      let estReasoningTokens = 0
       if (outputTokens === 0) {
         outputTokens = Math.ceil(contentText.length / CHARS_PER_TOKEN)
-        reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN)
+        estReasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN)
       }
 
-      const inputTokens = Math.ceil(pendingUserMessage.length / CHARS_PER_TOKEN)
+      // If we have shutdown metrics, input tokens will be distributed later.
+      // Otherwise fall back to estimating from the user message length.
+      const estInputTokens = hasMetrics ? 0 : Math.ceil(pendingUserMessage.length / CHARS_PER_TOKEN)
 
       // Same defensive guard as the modern event branch — corrupt legacy
       // sessions have shipped toolRequests as non-array values.
@@ -293,17 +420,17 @@ function parseTranscriptEvents(content: string, sessionId: string, seenKeys: Set
         .map(t => normalizeToolName(t?.name))
         .filter(Boolean)
 
-      const costUSD = calculateCost(model, inputTokens, outputTokens + reasoningTokens, 0, 0, 0)
+      const costUSD = calculateCost(model, estInputTokens, outputTokens + estReasoningTokens, 0, 0, 0)
 
       results.push({
         provider: 'copilot',
         model,
-        inputTokens,
+        inputTokens: estInputTokens,
         outputTokens,
         cacheCreationInputTokens: 0,
         cacheReadInputTokens: 0,
         cachedInputTokens: 0,
-        reasoningTokens,
+        reasoningTokens: estReasoningTokens,
         webSearchRequests: 0,
         costUSD,
         tools,
@@ -317,6 +444,12 @@ function parseTranscriptEvents(content: string, sessionId: string, seenKeys: Set
 
       pendingUserMessage = ''
     }
+  }
+
+  // If shutdown metrics exist, distribute them (overriding estimates).
+  // Otherwise keep the character-based input token estimates.
+  if (hasMetrics) {
+    distributeModelMetrics(results, modelMetrics)
   }
 
   return results

@@ -61,6 +61,17 @@ function transcriptAssistantMessage(opts: { messageId: string; content?: string;
   })
 }
 
+function sessionShutdown(opts: { modelMetrics?: Record<string, { requests: { count: number; cost: number }; usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens: number } }> }) {
+  return JSON.stringify({
+    type: 'session.shutdown',
+    data: {
+      shutdownType: 'routine',
+      totalPremiumRequests: Object.values(opts.modelMetrics ?? {}).reduce((s, m) => s + m.requests.count, 0),
+      modelMetrics: opts.modelMetrics,
+    },
+  })
+}
+
 describe('copilot provider - JSONL parsing', () => {
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'copilot-test-'))
@@ -357,6 +368,250 @@ describe('copilot provider - JSONL parsing', () => {
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.tools).toEqual(['mcp__github_mcp_server__list_issues', 'Read'])
+  })
+
+  it('distributes input tokens from session.shutdown modelMetrics', async () => {
+    const eventsPath = await createSessionDir('sess-shutdown-001', [
+      modelChange('claude-sonnet-4.6'),
+      userMessage('implement feature A'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 100 }),
+      userMessage('fix bug in feature A'),
+      assistantMessage({ messageId: 'msg-2', outputTokens: 300 }),
+      sessionShutdown({
+        modelMetrics: {
+          'claude-sonnet-4.6': {
+            requests: { count: 2, cost: 1 },
+            usage: {
+              inputTokens: 8000,
+              outputTokens: 400,
+              cacheReadTokens: 6000,
+              cacheWriteTokens: 500,
+              reasoningTokens: 0,
+            },
+          },
+        },
+      }),
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(2)
+    // msg-1 has 100/400 = 25% of output → should get 25% of input tokens
+    expect(calls[0]!.inputTokens).toBe(2000)   // 8000 * 0.25
+    expect(calls[0]!.cacheReadInputTokens).toBe(1500)  // 6000 * 0.25
+    expect(calls[0]!.cacheCreationInputTokens).toBe(125)   // 500 * 0.25
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+    // msg-2 has 300/400 = 75% of output → should get 75% of input tokens
+    expect(calls[1]!.inputTokens).toBe(6000)   // 8000 * 0.75
+    expect(calls[1]!.cacheReadInputTokens).toBe(4500)  // 6000 * 0.75
+    expect(calls[1]!.cacheCreationInputTokens).toBe(375)   // 500 * 0.75
+    expect(calls[1]!.costUSD).toBeGreaterThan(0)
+    // Verify totals match session shutdown metrics
+    const totalInput = calls.reduce((s, c) => s + c.inputTokens, 0)
+    expect(totalInput).toBe(8000)
+    const totalCacheRead = calls.reduce((s, c) => s + c.cacheReadInputTokens, 0)
+    expect(totalCacheRead).toBe(6000)
+    const totalCacheWrite = calls.reduce((s, c) => s + c.cacheCreationInputTokens, 0)
+    expect(totalCacheWrite).toBe(500)
+  })
+
+  it('handles multiple models in session.shutdown metrics', async () => {
+    const eventsPath = await createSessionDir('sess-multi-model', [
+      modelChange('claude-sonnet-4.6'),
+      userMessage('first task'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 200, timestamp: '2026-04-15T10:00:10Z' }),
+      modelChange('gpt-4.1', 'claude-sonnet-4.6'),
+      userMessage('second task'),
+      assistantMessage({ messageId: 'msg-2', outputTokens: 100, timestamp: '2026-04-15T10:01:00Z' }),
+      sessionShutdown({
+        modelMetrics: {
+          'claude-sonnet-4.6': {
+            requests: { count: 1, cost: 0.5 },
+            usage: { inputTokens: 5000, outputTokens: 200, cacheReadTokens: 3000, cacheWriteTokens: 0, reasoningTokens: 0 },
+          },
+          'gpt-4.1': {
+            requests: { count: 1, cost: 0.2 },
+            usage: { inputTokens: 2000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 },
+          },
+        },
+      }),
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(2)
+    // claude-sonnet-4.6 is 100% of its own model's output
+    expect(calls[0]!.model).toBe('claude-sonnet-4.6')
+    expect(calls[0]!.inputTokens).toBe(5000)
+    expect(calls[0]!.cacheReadInputTokens).toBe(3000)
+    // gpt-4.1 is 100% of its own model's output
+    expect(calls[1]!.model).toBe('gpt-4.1')
+    expect(calls[1]!.inputTokens).toBe(2000)
+    expect(calls[1]!.cacheReadInputTokens).toBe(0)
+  })
+
+  it('ignores session.shutdown with missing modelMetrics (backward compat)', async () => {
+    const shutdownNoMetrics = JSON.stringify({
+      type: 'session.shutdown',
+      data: { shutdownType: 'routine', totalPremiumRequests: 2 },
+    })
+    const eventsPath = await createSessionDir('sess-no-metrics', [
+      modelChange('gpt-4.1'),
+      userMessage('hello'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 100 }),
+      shutdownNoMetrics,
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    // Without metrics, input tokens remain 0 (backward compatible)
+    expect(calls[0]!.inputTokens).toBe(0)
+    // Cost is still calculated from output tokens alone
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+  })
+
+  it('handles session.shutdown model with zero output tokens gracefully', async () => {
+    const eventsPath = await createSessionDir('sess-zero-output-metric', [
+      modelChange('gpt-4.1'),
+      userMessage('hello'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 50 }),
+      sessionShutdown({
+        modelMetrics: {
+          'gpt-4.1': {
+            requests: { count: 1, cost: 0.1 },
+            usage: { inputTokens: 3000, outputTokens: 0, cacheReadTokens: 2000, cacheWriteTokens: 0, reasoningTokens: 0 },
+          },
+        },
+      }),
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    // When model's shutdown outputTokens is 0, skip distribution (divide by zero guard)
+    expect(calls[0]!.inputTokens).toBe(0)
+    expect(calls[0]!.costUSD).toBe(0)
+  })
+
+  it('distributes input tokens from session.shutdown in transcript format', async () => {
+    // Transcript format files start with session.start + producer: copilot-agent.
+    // The shutdown event may also appear in these files (e.g. ~/.copilot/session-state/
+    // events that now use the transcript schema). This tests that path.
+    const shutdownRaw = JSON.stringify({
+      type: 'session.shutdown',
+      data: {
+        shutdownType: 'routine',
+        modelMetrics: {
+          'claude-sonnet-4': {
+            requests: { count: 2, cost: 1 },
+            usage: {
+              inputTokens: 10000,
+              outputTokens: 500,
+              cacheReadTokens: 8000,
+              cacheWriteTokens: 0,
+              reasoningTokens: 200,
+            },
+          },
+        },
+      },
+    })
+    const eventsPath = await createSessionDir('sess-tr-shutdown', [
+      transcriptSessionStart('sess-tr-shutdown'),
+      transcriptUserMessage('implement feature'),
+      transcriptAssistantMessage({
+        messageId: 'msg-1',
+        content: 'here is the implementation',
+        toolCallIds: ['toolu_bdrk_abc'],
+      }),
+      transcriptUserMessage('fix the bug'),
+      transcriptAssistantMessage({
+        messageId: 'msg-2',
+        content: 'fixed it, done',
+        toolCallIds: ['toolu_bdrk_def'],
+      }),
+      shutdownRaw,
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(2)
+    // Both calls use the same model (copilot-anthropic-auto from toolCallId prefix),
+    // but modelMetrics is keyed by 'claude-sonnet-4'. Since the inferred model
+    // doesn't match, distribution skips → falls back to character counting.
+    // This verifies the model key must match.
+    expect(calls[0]!.model).toBe('copilot-anthropic-auto')
+
+    // Now test with matching model key in metrics:
+  })
+
+  it('distributes input tokens in transcript format when model keys match', async () => {
+    // The transcript parser infers model from toolCallId prefixes.
+    // When explicit model data is available on events, that takes priority.
+    const trMsgWithModel = (msgId: string, content: string, modelName: string) =>
+      JSON.stringify({
+        type: 'assistant.message',
+        data: {
+          messageId: msgId,
+          content,
+          toolRequests: [{ toolCallId: `toolu_bdrk_${msgId}`, name: 'read_file', type: 'function' }],
+          model: modelName,
+        },
+      })
+
+    const shutdownRaw = JSON.stringify({
+      type: 'session.shutdown',
+      data: {
+        shutdownType: 'routine',
+        modelMetrics: {
+          'claude-sonnet-4.5': {
+            requests: { count: 2, cost: 1 },
+            usage: {
+              inputTokens: 9000,
+              outputTokens: 300,
+              cacheReadTokens: 7200,
+              cacheWriteTokens: 100,
+              reasoningTokens: 0,
+            },
+          },
+        },
+      },
+    })
+
+    const eventsPath = await createSessionDir('sess-tr-model-match', [
+      transcriptSessionStart('sess-tr-model-match'),
+      transcriptUserMessage('do thing A'),
+      trMsgWithModel('msg-1', 'done with A', 'claude-sonnet-4.5'),
+      transcriptUserMessage('do thing B'),
+      trMsgWithModel('msg-2', 'here is B, much longer response that produces more output tokens relative to the first one', 'claude-sonnet-4.5'),
+      shutdownRaw,
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(2)
+    expect(calls.every(c => c.model === 'claude-sonnet-4.5')).toBe(true)
+
+    // msg-1 has shorter content, so fewer estimated output tokens → smaller share
+    // msg-2 has longer content → larger share of input tokens
+    expect(calls[0]!.inputTokens).toBeGreaterThan(0)
+    expect(calls[1]!.inputTokens).toBeGreaterThan(calls[0]!.inputTokens)
+    const totalInput = calls.reduce((s, c) => s + c.inputTokens, 0)
+    expect(totalInput).toBe(9000)
+    expect(calls.every(c => c.cacheReadInputTokens >= 0)).toBe(true)
+    expect(calls.every(c => c.costUSD > 0)).toBe(true)
   })
 })
 
